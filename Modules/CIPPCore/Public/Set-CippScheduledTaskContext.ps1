@@ -1,0 +1,46 @@
+function Set-CippScheduledTaskContext {
+    <#
+    .SYNOPSIS
+        Stores the scheduled task id in CIPPCore module-scoped AsyncLocal storage for the current invocation.
+    .DESCRIPTION
+        Used by the scheduler engine (Push-ExecScheduledCommand in CIPPActivityTriggers) so that CIPPCore functions
+        like Write-LogMessage can attribute log entries to the running scheduled task. Module script scope
+        is used instead of global scope, which is not reliable in Azure Functions.
+    .PARAMETER TaskId
+        The scheduled task RowKey. Pass $null or empty to clear.
+    .PARAMETER AlertReNotify
+        The alert task's re-notify setting, read by Write-AlertTrace. Reset on every call.
+    .PARAMETER AlertRun
+        A hashtable Write-AlertTrace adds the run's item counts to (New, Reopened, Continuing, Resolved,
+        Snoozed) and sets Reported on, so the scheduler can record what the run found. Reset on every call.
+    .PARAMETER PrivilegedUserRestricted
+        The task was queued by a caller without Identity.PrivilegedUser.ReadWrite, so Assert-CippPrivilegedUserAccess
+        checks its users. Reset on every call.
+    .FUNCTIONALITY
+        Internal
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$TaskId,
+        [bool]$AlertReNotify,
+        [hashtable]$AlertRun,
+        [bool]$PrivilegedUserRestricted
+    )
+
+    if (-not $script:CippScheduledTaskIdStorage) {
+        $script:CippScheduledTaskIdStorage = [System.Threading.AsyncLocal[string]]::new()
+    }
+    $script:CippScheduledTaskIdStorage.Value = $TaskId
+    if (-not $script:CippAlertReNotifyStorage) {
+        $script:CippAlertReNotifyStorage = [System.Threading.AsyncLocal[bool]]::new()
+    }
+    $script:CippAlertReNotifyStorage.Value = $AlertReNotify
+    if (-not $script:CippAlertRunStorage) {
+        $script:CippAlertRunStorage = [System.Threading.AsyncLocal[hashtable]]::new()
+    }
+    $script:CippAlertRunStorage.Value = $AlertRun
+    if (-not $script:CippPrivilegedUserRestrictedStorage) {
+        $script:CippPrivilegedUserRestrictedStorage = [System.Threading.AsyncLocal[bool]]::new()
+    }
+    $script:CippPrivilegedUserRestrictedStorage.Value = $PrivilegedUserRestricted
+}

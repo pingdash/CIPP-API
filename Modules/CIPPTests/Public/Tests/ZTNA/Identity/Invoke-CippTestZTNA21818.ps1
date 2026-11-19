@@ -1,0 +1,138 @@
+function Invoke-CippTestZTNA21818 {
+    <#
+    .SYNOPSIS
+    Privileged role activations have monitoring and alerting configured
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Tenant
+    )
+    #Tested
+    $TestId = 'ZTNA21818'
+
+    try {
+        if (-not (Test-CIPPStandardLicense -StandardName $TestId -TenantFilter $Tenant -Preset PIM -SkipLog)) {
+            Add-CippTestResult -TenantFilter $Tenant -TestId $TestId -TestType 'Identity' -Status 'Unlicensed' -ResultMarkdown 'This tenant is not licensed for Privileged Identity Management. Required capabilities: AAD_PREMIUM_P2, Entra_Identity_Governance.' -Risk 'High' -Name 'Privileged role activations have monitoring and alerting configured' -UserImpact 'Low' -ImplementationEffort 'Medium' -Category 'Monitoring'
+            return
+        }
+
+        $PrivilegedRoles = Get-CippDbRole -TenantFilter $Tenant -IncludePrivilegedRoles
+        $RoleManagementPolicies = Get-CIPPTestData -TenantFilter $Tenant -Type 'RoleManagementPolicies'
+
+        $Notifications = @(
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when members are assigned as eligible to this role'
+                NotificationType     = 'Role assignment alert'
+                RuleId               = 'Notification_Admin_Admin_Eligibility'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when members are assigned as eligible to this role'
+                NotificationType     = 'Notification to the assigned user (assignee)'
+                RuleId               = 'Notification_Requestor_Admin_Eligibility'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when members are assigned as eligible to this role'
+                NotificationType     = 'Request to approve a role assignment renewal/extension'
+                RuleId               = 'Notification_Approver_Admin_Eligibility'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when members are assigned as active to this role'
+                NotificationType     = 'Role assignment alert'
+                RuleId               = 'Notification_Admin_Admin_Assignment'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when members are assigned as active to this role'
+                NotificationType     = 'Notification to the assigned user (assignee)'
+                RuleId               = 'Notification_Requestor_Admin_Assignment'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when members are assigned as active to this role'
+                NotificationType     = 'Request to approve a role assignment renewal/extension'
+                RuleId               = 'Notification_Approver_Admin_Assignment'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when eligible members activate this role'
+                NotificationType     = 'Role activation alert'
+                RuleId               = 'Notification_Admin_EndUser_Assignment'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when eligible members activate this role'
+                NotificationType     = 'Notification to activated user (requestor)'
+                RuleId               = 'Notification_Requestor_EndUser_Assignment'
+            }
+            [PSCustomObject]@{
+                NotificationScenario = 'Send notifications when eligible members activate this role'
+                NotificationType     = 'Request to approve an activation'
+                RuleId               = 'Notification_Approver_EndUser_Assignment'
+            }
+        )
+
+        $NotificationRules = [System.Collections.Generic.List[object]]::new()
+        $MissingRules = [System.Collections.Generic.List[string]]::new()
+        $Passed = $true
+        $ExitLoop = $false
+
+        # roleDefinitionId carries the role's TEMPLATE id — matching it against $Role.id (the
+        # directoryRole instance id) never succeeded.
+        $PolicyByRoleId = @{}
+        foreach ($RolePolicy in $RoleManagementPolicies) {
+            if ($RolePolicy.scopeId -eq '/' -and $RolePolicy.scopeType -eq 'DirectoryRole' -and $RolePolicy.roleDefinitionId -and -not $PolicyByRoleId.ContainsKey("$($RolePolicy.roleDefinitionId)")) {
+                $PolicyByRoleId["$($RolePolicy.roleDefinitionId)"] = $RolePolicy
+            }
+        }
+
+        foreach ($Role in $PrivilegedRoles) {
+            $Policy = $PolicyByRoleId["$($Role.roleTemplateId)"]
+
+            if (-not $Policy) { continue }
+
+            foreach ($NotificationRuleId in $Notifications.RuleId) {
+                $Rule = $Policy.rules.Where({ $_.id -eq $NotificationRuleId }, 'First')[0]
+
+                if (-not $Rule) {
+                    $MissingRules.Add("$($Role.displayName): $NotificationRuleId")
+                    continue
+                }
+
+                $RuleWithRole = $Rule | Select-Object *, @{Name = 'RoleDisplayName'; Expression = { $Role.displayName } }
+                $NotificationRules.Add($RuleWithRole)
+
+                # A rule notifies nobody only when default recipients are off and no extra recipients are set.
+                if ($Rule.isDefaultRecipientsEnabled -eq $false -and ($null -eq $Rule.notificationRecipients -or $Rule.notificationRecipients.Count -eq 0)) {
+                    $Passed = $false
+                    $ExitLoop = $true
+                    break
+                }
+            }
+
+            if ($ExitLoop) { break }
+        }
+
+        if ($Passed -and $MissingRules.Count -gt 0) {
+            $ResultMarkdown = [System.Text.StringBuilder]::new("No privileged role was found with silenced notifications, but some notification rules were missing from the cached PIM role settings and could not be checked. Refresh the tenant's cache and re-run.`n`n- $($MissingRules -join "`n- ")`n`n")
+        } elseif ($Passed) {
+            $ResultMarkdown = [System.Text.StringBuilder]::new("Role notifications are properly configured for privileged role.`n`n")
+        } else {
+            $ResultMarkdown = [System.Text.StringBuilder]::new("Role notifications are not properly configured.`n`nNote: To save time, this check stops when it finds the first role that does not have notifications. After fixing this role and all other roles, we recommend running the check again to verify.`n`n")
+        }
+
+        $null = $ResultMarkdown.Append("## Notifications for high privileged roles`n`n")
+        $null = $ResultMarkdown.Append("| Role Name | Notification Scenario | Notification Type | Default Recipients Enabled | Additional Recipients |`n")
+        $null = $ResultMarkdown.Append("| :-------- | :-------------------- | :---------------- | :------------------------- | :-------------------- |`n")
+
+        foreach ($NotificationRule in $NotificationRules) {
+            $MatchingNotification = $Notifications.Where({ $_.RuleId -eq $NotificationRule.id })
+            $Recipients = if ($NotificationRule.notificationRecipients) { ($NotificationRule.notificationRecipients -join ', ') } else { '' }
+            $null = $ResultMarkdown.Append("| $($NotificationRule.roleDisplayName) | $($MatchingNotification.notificationScenario) | $($MatchingNotification.notificationType) | $($NotificationRule.isDefaultRecipientsEnabled) | $Recipients |`n")
+        }
+
+        $Status = if (-not $Passed) { 'Failed' } elseif ($MissingRules.Count -gt 0) { 'Investigate' } else { 'Passed' }
+        Add-CippTestResult -TenantFilter $Tenant -TestId $TestId -TestType 'Identity' -Status $Status -ResultMarkdown $ResultMarkdown -Risk 'High' -Name 'Privileged role activations have monitoring and alerting configured' -UserImpact 'Low' -ImplementationEffort 'Medium' -Category 'Monitoring'
+
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -API 'Tests' -tenant $Tenant -message "Failed to run test: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+        Add-CippTestResult -TenantFilter $Tenant -TestId $TestId -TestType 'Identity' -Status 'Failed' -ResultMarkdown "Error running test: $($ErrorMessage.NormalizedError)" -Risk 'High' -Name 'Privileged role activations have monitoring and alerting configured' -UserImpact 'Low' -ImplementationEffort 'Medium' -Category 'Monitoring'
+    }
+}

@@ -1,0 +1,142 @@
+function Get-CIPPAlertVulnerabilities {
+    <#
+    .FUNCTIONALITY
+        Entrypoint
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [Alias('input')]
+        $InputValue,
+        $TenantFilter
+    )
+
+    # Extract filter parameters from InputValue
+    $ExploitabilityLevels = [System.Collections.Generic.List[string]]::new()
+    if ($InputValue -is [hashtable] -or $InputValue -is [PSCustomObject]) {
+        # Number inputs are stored directly
+        $AgeThresholdHours = if ($InputValue.VulnerabilityAgeHours) { [int]$InputValue.VulnerabilityAgeHours } else { 0 }
+        # Autocomplete inputs store value in .value subproperty
+        $CVSSSeverity = if ($InputValue.CVSSSeverity.value) { $InputValue.CVSSSeverity.value } else { 'low' }
+        # Switch inputs are stored as boolean
+        $NewerThanMode = [bool]($InputValue.NewerThanMode)
+        # Multi-select autocomplete returns array of objects with .value
+        if ($InputValue.ExploitabilityLevels) {
+            foreach ($level in $InputValue.ExploitabilityLevels) {
+                $ExploitabilityLevels.Add($(if ($level.value) { $level.value } else { $level }))
+            }
+        }
+    } else {
+        $NewerThanMode = $false
+        # Backward compatibility: simple value = hours threshold
+        $AgeThresholdHours = if ($InputValue) { [int]$InputValue } else { 0 }
+        $CVSSSeverity = 'low'
+    }
+
+    # Convert CVSS severity to minimum score
+    $CVSSMinScore = switch ($CVSSSeverity.ToLower()) {
+        'critical' { 9.0 }
+        'high' { 7.0 }
+        'medium' { 4.0 }
+        'low' { 0.0 }
+        default { 0.0 }
+    }
+
+    try {
+        # Fold the streamed export into one small bucket per CVE (earliest record, record count,
+        # unique device names) instead of grouping every device x CVE record in memory. Each device
+        # name is stored once tenant-wide and buckets hold its index, as the DefenderCVEs cache does.
+        $Buckets = @{}
+        $DeviceIndex = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
+        $DeviceNames = [System.Collections.Generic.List[string]]::new()
+        $Fields = @('cveId', 'deviceName', 'firstSeenTimestamp', 'lastSeenTimestamp', 'cvssScore', 'vulnerabilitySeverityLevel', 'exploitabilityLevel',
+            'softwareName', 'softwareVendor', 'softwareVersion', 'recommendedSecurityUpdate', 'recommendedSecurityUpdateId', 'recommendedSecurityUpdateUrl')
+        Get-DefenderTvmRaw -TenantId $TenantFilter -Stream -Property $Fields | & { process {
+            if (-not $_.cveId) { return }
+            $Bucket = $Buckets[$_.cveId]
+            if (-not $Bucket) {
+                $Bucket = @{ First = $_; Count = 0; Devices = [System.Collections.Generic.List[int]]::new(); Seen = [System.Collections.Generic.HashSet[int]]::new() }
+                $Buckets[$_.cveId] = $Bucket
+            } elseif ($_.firstSeenTimestamp -lt $Bucket.First.firstSeenTimestamp) {
+                $Bucket.First = $_
+            }
+            $Bucket.Count++
+            $DeviceName = [string]$_.deviceName
+            $Index = $DeviceIndex[$DeviceName]
+            if ($null -eq $Index) {
+                $Index = $DeviceNames.Count
+                $DeviceIndex[$DeviceName] = $Index
+                $DeviceNames.Add($DeviceName)
+            }
+            if ($Bucket.Seen.Add($Index)) { $Bucket.Devices.Add($Index) }
+        } }
+
+        if ($Buckets.Count -gt 0) {
+            $AlertData = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+            foreach ($CveId in ($Buckets.Keys | Sort-Object)) {
+                $Bucket = $Buckets[$CveId]
+                $FirstVuln = $Bucket.First
+                $HoursOld = [math]::Round(((Get-Date) - [datetime]$FirstVuln.firstSeenTimestamp).TotalHours)
+
+                # Skip based on age threshold mode
+                if ($NewerThanMode) {
+                    # Newer-than mode: only alert on items newer than threshold
+                    if ($HoursOld -gt $AgeThresholdHours) {
+                        continue
+                    }
+                } else {
+                    # Older-than mode (default): only alert on items older than threshold
+                    if ($HoursOld -lt $AgeThresholdHours) {
+                        continue
+                    }
+                }
+
+                # Skip if CVSS score is below minimum threshold
+                $VulnCVSS = if ($null -ne $FirstVuln.cvssScore) { [double]$FirstVuln.cvssScore } else { 0 }
+                if ($VulnCVSS -lt $CVSSMinScore) {
+                    continue
+                }
+
+                # Skip if exploitability level doesn't match filter (unless "All" is selected)
+                if ($ExploitabilityLevels.Count -gt 0 -and 'All' -notin $ExploitabilityLevels) {
+                    if ($FirstVuln.exploitabilityLevel -notin $ExploitabilityLevels) {
+                        continue
+                    }
+                }
+
+                $DaysOld = [math]::Round(((Get-Date) - [datetime]$FirstVuln.firstSeenTimestamp).TotalDays)
+                $Names = [string[]]::new($Bucket.Devices.Count)
+                for ($i = 0; $i -lt $Names.Length; $i++) { $Names[$i] = $DeviceNames[$Bucket.Devices[$i]] }
+                $AffectedDevices = [string]::Join(', ', $Names)
+
+                $VulnerabilityAlert = [PSCustomObject]@{
+                    Id                   = $CveId
+                    CVE                  = $CveId
+                    Severity             = $FirstVuln.vulnerabilitySeverityLevel
+                    FirstSeenTimestamp   = $FirstVuln.firstSeenTimestamp
+                    LastSeenTimestamp    = $FirstVuln.lastSeenTimestamp
+                    DaysOld              = $DaysOld
+                    HoursOld             = $HoursOld
+                    AffectedDeviceCount  = $Bucket.Count
+                    SoftwareName         = $FirstVuln.softwareName
+                    SoftwareVendor       = $FirstVuln.softwareVendor
+                    SoftwareVersion      = $FirstVuln.softwareVersion
+                    CVSSScore            = $FirstVuln.cvssScore
+                    ExploitabilityLevel  = $FirstVuln.exploitabilityLevel
+                    RecommendedUpdate    = $FirstVuln.recommendedSecurityUpdate
+                    RecommendedUpdateId  = $FirstVuln.recommendedSecurityUpdateId
+                    RecommendedUpdateUrl = $FirstVuln.recommendedSecurityUpdateUrl
+                    AffectedDevices      = $AffectedDevices
+                    Tenant               = $TenantFilter
+                }
+                $AlertData.Add($VulnerabilityAlert)
+            }
+
+        }
+
+        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
+    } catch {
+        Write-LogMessage -message "Failed to check vulnerabilities: $($_.exception.message)" -API 'Vulnerability Alerts' -tenant $TenantFilter -sev Error
+    }
+}

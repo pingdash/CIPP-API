@@ -1,0 +1,47 @@
+function Invoke-RemoveAppTemplate {
+    <#
+    .FUNCTIONALITY
+        Entrypoint,AnyTenant
+    .ROLE
+        Endpoint.Application.ReadWrite
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    if (-not (Test-CippTemplateWriteAccess)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Forbidden; Body = @{ Results = 'Roles limited to specific tenants cannot change or remove shared templates.' } })
+    }
+
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
+
+    try {
+        $ID = $Request.Body.ID ?? $Request.Query.ID
+        if (!$ID) { throw 'No template ID provided' }
+
+        $Table = Get-CippTable -tablename 'templates'
+        $SafeID = ConvertTo-CIPPODataFilterValue -Value $ID -Type Guid
+        $Filter = "PartitionKey eq 'AppTemplate' and RowKey eq '$SafeID'"
+        $Entity = Get-CIPPAzDataTableEntity @Table -Filter $Filter
+        if ($Entity) {
+            Remove-CIPPAzDataTableEntity @Table -Entity $Entity
+            $PackageIds = [regex]::Matches([string]$Entity.JSON, 'packageId\\?"\s*:\s*\\?"([0-9a-fA-F-]{36})').ForEach({ $_.Groups[1].Value })
+            Remove-CIPPUnusedAppPackage -PackageIds $PackageIds
+            $Result = 'Successfully removed app template'
+            Write-LogMessage -headers $Headers -API $APIName -message "Removed app template $ID" -Sev 'Info'
+        } else {
+            $Result = 'Template not found'
+        }
+        $StatusCode = [HttpStatusCode]::OK
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        $Result = "Failed to remove app template: $($ErrorMessage.NormalizedError)"
+        Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Error' -LogData $ErrorMessage
+        $StatusCode = [HttpStatusCode]::InternalServerError
+    }
+
+    return ([HttpResponseContext]@{
+        StatusCode = $StatusCode
+        Body       = @{ Results = $Result }
+    })
+}

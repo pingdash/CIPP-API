@@ -1,0 +1,96 @@
+function Invoke-ListLicensesReport {
+    <#
+    .FUNCTIONALITY
+        Entrypoint,TenantGroup
+    .ROLE
+        Tenant.Directory.Read
+    .DESCRIPTION
+        Lists a detailed license overview across all tenants or a single tenant, including SKU breakdowns, costs, and availability.
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+    $TenantFilter = $Request.Query.tenantFilter
+    $QueueId = $Request.Query.QueueId
+    $Metadata = @{}
+
+    if ($TenantFilter -ne 'AllTenants') {
+        $GraphRequest = Get-CIPPLicenseOverview -TenantFilter $TenantFilter
+    } else {
+        $Table = Get-CIPPTable -TableName cachelicenses
+
+        if ($QueueId) {
+            $Filter = "QueueId eq '{0}'" -f (ConvertTo-CIPPODataFilterValue -Value $QueueId)
+            $Rows = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Select-CippAllowedTenantData -TenantProperty RowKey
+        } else {
+            $Timestamp = (Get-Date).AddHours(-1).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+            $Filter = "Timestamp ge datetime'{0}'" -f $Timestamp
+            $Tenants = Get-Tenants -IncludeErrors
+            $Rows = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object { $_.RowKey -in $Tenants.defaultDomainName }
+        }
+
+        if ($Rows) {
+            $GraphRequest = $Rows | ForEach-Object {
+                $LicenseData = $_.License | ConvertFrom-Json -ErrorAction SilentlyContinue
+                foreach ($License in $LicenseData) {
+                    $License
+                }
+            }
+        } else {
+            $QueueReference = 'AllTenants-Licenses'
+            $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' -and $_.Reference -eq $QueueReference }
+
+            if ($RunningQueue) {
+                $Metadata.Queued = $true
+                $Metadata.QueueMessage = 'Data still processing, please wait'
+                $Metadata.QueueId = $RunningQueue.RowKey
+                $GraphRequest = @()
+            } else {
+                $TenantList = Get-Tenants -IncludeErrors
+                if (($TenantList | Measure-Object).Count -gt 0) {
+                    $Queue = New-CippQueueEntry -Name 'Licenses (All Tenants)' -Reference $QueueReference -TotalTasks ($TenantList | Measure-Object).Count
+                    $TenantList = $TenantList | Select-Object customerId, defaultDomainName, @{Name = 'QueueId'; Expression = { $Queue.RowKey } }, @{Name = 'FunctionName'; Expression = { 'ListLicensesQueue' } }, @{Name = 'QueueName'; Expression = { $_.defaultDomainName } }
+                    $InputObject = [PSCustomObject]@{
+                        OrchestratorName = 'ListLicensesOrchestrator'
+                        Batch            = @($TenantList)
+                        SkipLog          = $true
+                    }
+                    $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
+                    Write-Host "Started licenses orchestration with ID = '$InstanceId'"
+
+                    $Metadata.Queued = $true
+                    $Metadata.QueueMessage = 'Loading data for all tenants. Please check back after the job completes'
+                    $Metadata.QueueId = $Queue.RowKey
+                }
+                $GraphRequest = @()
+            }
+        }
+    }
+
+    # Tenant display name (the alias when one is set), resolved on read so a renamed tenant shows up straight away
+    $TenantNames = @{}
+    if ($GraphRequest) {
+        foreach ($KnownTenant in (Get-Tenants -IncludeErrors)) {
+            if ($KnownTenant.defaultDomainName) { $TenantNames[[string]$KnownTenant.defaultDomainName] = $KnownTenant.displayName }
+            if ($KnownTenant.customerId) { $TenantNames[[string]$KnownTenant.customerId] = $KnownTenant.displayName }
+        }
+    }
+
+    # Strip the Term property from each TermInfo entry before returning
+    foreach ($Result in $GraphRequest) {
+        $Result | Add-Member -NotePropertyName 'TenantName' -NotePropertyValue ($TenantNames[[string]$Result.Tenant] ?? $Result.Tenant) -Force
+        if ($Result.TermInfo) {
+            $Result.TermInfo = @($Result.TermInfo | Select-Object -Property * -ExcludeProperty Term)
+        }
+    }
+
+    $Body = [PSCustomObject]@{
+        Results  = @($GraphRequest)
+        Metadata = $Metadata
+    }
+
+    return ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]::OK
+            Body       = $Body
+        })
+
+}

@@ -1,0 +1,235 @@
+function Invoke-ExecGDAPAccessAssignment {
+    <#
+    .FUNCTIONALITY
+        Entrypoint,AnyTenant
+    .ROLE
+        Tenant.Relationship.ReadWrite
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $APIName = $Request.Params.CIPPEndpoint
+
+    $Action = $Request.Body.Action ?? $Request.Query.Action
+    $Id = $Request.Body.Id ?? $Request.Query.Id
+    # The id is placed in a Graph URL, so it must be a relationship id and nothing else.
+    if (-not (Test-CIPPGDAPRelationshipId -Id "$Id")) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = 'Invalid relationship id' } })
+    }
+
+    # Multi-partner: act as the relationship's source partner (defaults to the primary)
+    $PartnerTenantId = $Request.Body.partnerTenantId.value ?? $Request.Body.partnerTenantId ?? $Request.Query.partnerTenantId
+    if (!$PartnerTenantId -or -not (Get-CIPPPartnerTenantList | Where-Object { $_.partnerTenantId -eq $PartnerTenantId })) {
+        $PartnerTenantId = $env:TenantID
+    }
+
+    switch ($Action) {
+        'ResetMappings' {
+            $RoleTemplateId = $Request.Body.RoleTemplateId
+
+            if (-not $RoleTemplateId) {
+                $Body = @{
+                    Results = @{
+                        state      = 'error'
+                        resultText = 'RoleTemplateId is required'
+                    }
+                }
+            } else {
+                $GDAPRoleTemplatesTable = Get-CIPPTable -TableName 'GDAPRoleTemplates'
+                $Mappings = Get-CIPPAzDataTableEntity @GDAPRoleTemplatesTable -Filter "PartitionKey eq 'RoleTemplate' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $RoleTemplateId)'" | Select-Object -ExpandProperty RoleMappings | ConvertFrom-Json
+
+                $RelationshipRequests = @(
+                    @{
+                        'id'     = 'getRelationship'
+                        'url'    = "tenantRelationships/delegatedAdminRelationships/$Id"
+                        'method' = 'GET'
+                    }
+                    @{
+                        'id'     = 'getAccessAssignments'
+                        'url'    = "tenantRelationships/delegatedAdminRelationships/$Id/accessAssignments"
+                        'method' = 'GET'
+                    }
+                )
+
+                $RelationshipResults = New-GraphBulkRequest -Requests $RelationshipRequests -NoAuthCheck $true -tenantid $PartnerTenantId
+                $Relationship = ($RelationshipResults | Where-Object id -EQ 'getRelationship').body
+                $AccessAssignments = ($RelationshipResults | Where-Object id -EQ 'getAccessAssignments').body.value
+
+                # The router cannot see the relationship's customer; an unknown customer needs an unlimited role.
+                if (-not (Test-CippTenantInScope -Tenant ($Relationship.customer.tenantId ?? 'AllTenants'))) {
+                    return ([HttpResponseContext]@{
+                            StatusCode = [HttpStatusCode]::Forbidden
+                            Body       = @{ Results = @(@{ state = 'error'; resultText = "Your roles don't include this relationship's customer tenant." }) }
+                        })
+                }
+
+                $Groups = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/groups?`$top=999&`$select=id,displayName&`$filter=securityEnabled eq true" -asApp $true -NoAuthCheck $true -tenantid $PartnerTenantId
+
+                # Validate/correct the template's group mappings against the partner tenant before creating any
+                # access assignments - a stale GroupId would otherwise fail with "access container does not exist".
+                $GroupCheck = Test-CIPPGDAPGroupMappings -RoleMappings $Mappings -PartnerGroups $Groups -WriteBack -TemplateId $RoleTemplateId -Headers $Request.Headers -PartnerTenantId $PartnerTenantId
+                $Mappings = $GroupCheck.RoleMappings
+
+                $Requests = [System.Collections.Generic.List[object]]::new()
+                $Messages = [System.Collections.Generic.List[object]]::new()
+
+                $MappingResults = [System.Collections.Generic.List[object]]::new()
+                foreach ($GroupResult in $GroupCheck.Results) {
+                    if ($GroupResult.Status -eq 'Stale') {
+                        $MappingResults.Add(@{ resultText = $GroupResult.Message; state = 'success' })
+                    } elseif ($GroupResult.Status -in @('Missing', 'Reserved')) {
+                        $MappingResults.Add(@{ resultText = $GroupResult.Message; state = 'error' })
+                    }
+                }
+
+                # Drop mappings whose group could not be resolved so we never POST a non-existent access container
+                $MissingGroupIds = @($GroupCheck.Results | Where-Object { $_.Status -eq 'Missing' } | Select-Object -ExpandProperty GroupId)
+                if ($MissingGroupIds.Count -gt 0) {
+                    $Mappings = @($Mappings | Where-Object { $_.GroupId -notin $MissingGroupIds })
+                }
+
+                foreach ($AccessAssignment in $AccessAssignments) {
+                    $RoleCount = ($AccessAssignment.accessDetails.unifiedRoles | Measure-Object).Count
+                    if ($Mappings.GroupId -notcontains $AccessAssignment.accessContainer.accessContainerId -and $AccessAssignment.status -notin @('deleting', 'deleted', 'error')) {
+                        Write-Warning "Deleting access assignment for $($AccessAssignment.accessContainer.accessContainerId)"
+                        $Group = $Groups | Where-Object id -EQ $AccessAssignment.accessContainer.accessContainerId
+                        $Requests.Add(@{
+                                'id'      = "delete-$($AccessAssignment.id)"
+                                'url'     = "tenantRelationships/delegatedAdminRelationships/$Id/accessAssignments/$($AccessAssignment.id)"
+                                'method'  = 'DELETE'
+                                'headers' = @{
+                                    'If-Match' = $AccessAssignment.'@odata.etag'
+                                }
+                            })
+
+                        $Messages.Add(@{
+                                'id'      = "delete-$($AccessAssignment.id)"
+                                'message' = "Deleting access assignment for $($Group.displayName)"
+                            })
+
+                    } elseif ($AccessAssignment.status -notin @('deleting', 'deleted', 'error')) {
+                        # check for mismatched role definitions (e.g. role in assignment does not match role in mapping)
+                        $Mapping = $Mappings | Where-Object { $_.GroupId -eq $AccessAssignment.accessContainer.accessContainerId }
+                        $Group = $Groups | Where-Object id -EQ $AccessAssignment.accessContainer.accessContainerId
+
+                        if ($RoleCount -gt 1 -or $AccessAssignment.accessDetails.unifiedRoles.roleDefinitionId -notcontains $Mapping.roleDefinitionId) {
+                            Write-Warning "Patching access assignment for $($AccessAssignment.accessContainer.accessContainerId)"
+                            $Requests.Add(@{
+                                    'id'      = "patch-$($AccessAssignment.id)"
+                                    'url'     = "tenantRelationships/delegatedAdminRelationships/$Id/accessAssignments/$($AccessAssignment.id)"
+                                    'method'  = 'PATCH'
+                                    'body'    = @{
+                                        'accessDetails' = @{
+                                            'unifiedRoles' = @(
+                                                @{
+                                                    roleDefinitionId = $Mapping.roleDefinitionId
+                                                }
+                                            )
+                                        }
+                                    }
+                                    'headers' = @{
+                                        'If-Match'     = $AccessAssignment.'@odata.etag'
+                                        'Content-Type' = 'application/json'
+                                    }
+                                })
+
+                            $Messages.Add(@{
+                                    'id'      = "patch-$($AccessAssignment.id)"
+                                    'message' = "Updating access assignment for $($Group.displayName)"
+                                })
+                        }
+                    }
+                }
+
+                foreach ($Mapping in $Mappings) {
+                    # A group re-mapped after a removal keeps its deleted assignment listed next to the live one
+                    $LiveAssignment = @($AccessAssignments).Where({ $_.accessContainer.accessContainerId -eq $Mapping.GroupId -and $_.status -ne 'deleted' }, 'First')
+                    if ($LiveAssignment.Count -eq 0 -and $Relationship.accessDetails.unifiedRoles.roleDefinitionId -contains $Mapping.roleDefinitionId) {
+                        Write-Information "Creating access assignment for $($Mapping.GroupId)"
+                        $Requests.Add(@{
+                                'id'      = "create-$($Mapping.GroupId)"
+                                'url'     = "tenantRelationships/delegatedAdminRelationships/$Id/accessAssignments"
+                                'method'  = 'POST'
+                                'body'    = @{
+                                    'accessDetails'   = @{
+                                        'unifiedRoles' = @(
+                                            @{
+                                                roleDefinitionId = $Mapping.roleDefinitionId
+                                            }
+                                        )
+                                    }
+                                    'accessContainer' = @{
+                                        'accessContainerId'   = $Mapping.GroupId
+                                        'accessContainerType' = 'securityGroup'
+                                    }
+                                }
+                                'headers' = @{
+                                    'Content-Type' = 'application/json'
+                                }
+                            })
+                        $Messages.Add(@{
+                                'id'      = "create-$($Mapping.GroupId)"
+                                'message' = "Creating access assignment for $($Mapping.GroupName)"
+                            })
+                    }
+                }
+
+                if ($Requests) {
+                    Write-Warning "Executing $($Requests.Count) access assignment changes"
+                    Write-Information ($Requests | ConvertTo-Json -Depth 10)
+
+                    $BulkResults = New-GraphBulkRequest -Requests $Requests -NoAuthCheck $true -tenantid $PartnerTenantId
+
+                    Write-Warning "Received $($BulkResults.Count) access assignment results"
+                    Write-Information ($BulkResults | ConvertTo-Json -Depth 10)
+                    $Results = foreach ($Result in $BulkResults) {
+                        $Message = $Messages | Where-Object id -EQ $Result.id
+                        if ($Result.status -in @('201', '202', '204')) {
+                            Write-LogMessage -headers $Request.Headers -API $APIName -tenant 'Global' -message $Message.message -Sev 'Info'
+                            @{
+                                resultText = $Message.message
+                                state      = 'success'
+                            }
+                        } else {
+                            Write-LogMessage -headers $Request.Headers -API $APIName -tenant 'Global' -message "Error: $($Message.message): $($Result.body.error.message)" -Sev 'Error'
+                            @{
+                                resultText = "Error: $($Message.message): $($Result.body.error.message)"
+                                state      = 'error'
+                            }
+                        }
+                    }
+
+                } elseif ($MappingResults.Count -eq 0) {
+                    $Results = @{
+                        resultText = 'This relationship already has the correct access assignments'
+                        state      = 'success'
+                    }
+                    Write-LogMessage -headers $Request.Headers -API $APIName -tenant 'Global' -message 'GDAP access assignments already correct; no changes applied' -Sev 'Info'
+                } else {
+                    $Results = @()
+                }
+
+                # Surface any group mapping corrections / missing groups alongside the assignment changes
+                if ($MappingResults.Count -gt 0) {
+                    $Results = @($MappingResults) + @($Results)
+                }
+
+                $Body = @{
+                    Results = @($Results)
+                }
+            }
+        }
+        default {
+            $Body = @{
+                Results = @(@{
+                        state      = 'error'
+                        resultText = 'Invalid action'
+                    })
+            }
+        }
+    }
+    return ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]::OK
+            Body       = $Body
+        })
+}

@@ -1,0 +1,73 @@
+function Invoke-AddAutopilotConfig {
+    <#
+    .FUNCTIONALITY
+        Entrypoint
+    .ROLE
+        Endpoint.Autopilot.ReadWrite
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+    # Input bindings are passed in via param block.
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
+    $Tenants = $Request.Body.selectedTenants.value
+
+    # Tenant scope: a scoped role must not reach tenants outside its allowed set through selectedTenants.
+    $AllowedTenants = Test-CippAccess -Request $Request -TenantList
+    if ('AllTenants' -notin $AllowedTenants) {
+        $AllowedTenantList = (Get-Tenants -IncludeErrors) | Where-Object { $_.customerId -in $AllowedTenants }
+        $Tenants = $Tenants | Where-Object { $_ -in $AllowedTenantList.defaultDomainName }
+    }
+
+    $Profbod = [pscustomobject]$Request.Body
+
+    $NameCheck = Test-CIPPAutopilotProfileName -DisplayName $Request.Body.DisplayName
+    if (-not $NameCheck.IsValid) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = @{'Results' = $NameCheck.Message }
+            })
+    }
+
+    $UserType = if ($Profbod.NotLocalAdmin -eq 'true') { 'standard' } else { 'administrator' }
+    $DeploymentMode = if ($Profbod.DeploymentMode -eq 'true') { 'shared' } else { 'singleUser' }
+
+    # The frontend group picker sends option objects ({ value, label }); accept those plus
+    # bare id strings from direct API callers, and drop anything empty.
+    $GroupIds = @(
+        $Request.Body.GroupIds | ForEach-Object {
+            if ($_ -is [string]) { $_.Trim() } elseif ($_ -and $_.value) { $_.value }
+        } | Where-Object { $_ }
+    )
+
+    # If deployment mode is shared, disable white glove (pre-provisioning) as it's not supported
+    $AllowWhiteGlove = if ($DeploymentMode -eq 'shared') { $false } else { $Profbod.allowWhiteGlove }
+
+    $profileParams = @{
+        DisplayName        = $Request.Body.DisplayName
+        Description        = $Request.Body.Description
+        UserType           = $UserType
+        DeploymentMode     = $DeploymentMode
+        AssignTo           = $Request.Body.Assignto
+        GroupIds           = $GroupIds
+        DeviceNameTemplate = $Profbod.DeviceNameTemplate
+        AllowWhiteGlove    = $AllowWhiteGlove
+        CollectHash        = $Profbod.CollectHash
+        HideChangeAccount  = $Profbod.HideChangeAccount
+        HidePrivacy        = $Profbod.HidePrivacy
+        HideTerms          = $Profbod.HideTerms
+        Autokeyboard       = $Profbod.Autokeyboard
+        Language           = $ProfBod.languages.value
+        Headers            = $Headers
+        APIName            = $APIName
+    }
+    $Results = foreach ($tenant in $Tenants) {
+        $profileParams['tenantFilter'] = $tenant
+        Set-CIPPDefaultAPDeploymentProfile @profileParams
+    }
+
+    return ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]::OK
+            Body       = @{'Results' = $Results }
+        })
+}

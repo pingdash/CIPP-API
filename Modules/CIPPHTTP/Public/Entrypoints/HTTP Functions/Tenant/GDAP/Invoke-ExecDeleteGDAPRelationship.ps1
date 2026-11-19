@@ -1,0 +1,44 @@
+function Invoke-ExecDeleteGDAPRelationship {
+    <#
+    .FUNCTIONALITY
+        Entrypoint,AnyTenant
+    .ROLE
+        Tenant.Relationship.ReadWrite
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
+
+
+    # Interact with query parameters or the body of the request.
+    $GDAPId = $Request.Query.GDAPId ?? $Request.Body.GDAPId
+    # The id is placed in a Graph URL, so it must be a relationship id and nothing else.
+    if (-not (Test-CIPPGDAPRelationshipId -Id "$GDAPId")) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = 'Invalid relationship id' } })
+    }
+    # Multi-partner: act as the relationship's source partner (defaults to the primary)
+    $PartnerTenantId = $Request.Query.partnerTenantId ?? $Request.Body.partnerTenantId
+    if (!$PartnerTenantId -or -not (Get-CIPPPartnerTenantList | Where-Object { $_.partnerTenantId -eq $PartnerTenantId })) {
+        $PartnerTenantId = $env:TenantID
+    }
+    try {
+        $null = New-GraphPostRequest -NoAuthCheck $True -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships/$($GDAPId)/requests" -type POST -body '{"action":"terminate"}' -tenantid $PartnerTenantId
+        $Result = "Success. GDAP relationship for $($GDAPId) been revoked"
+        Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Info'
+        $StatusCode = [HttpStatusCode]::OK
+
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        $Result = "Failed to revoke GDAP relationship for $($GDAPId). Error: $($ErrorMessage.NormalizedError)"
+        $StatusCode = [HttpStatusCode]::InternalServerError
+        Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Error' -LogData $ErrorMessage
+    }
+
+    return ([HttpResponseContext]@{
+            StatusCode = $StatusCode
+            Body       = @{ 'Results' = $Result }
+        })
+
+}

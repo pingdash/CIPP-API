@@ -1,0 +1,76 @@
+function Set-CIPPGDAPInviteGroups {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    Param($Relationship)
+    $Table = Get-CIPPTable -TableName 'GDAPInvites'
+
+    if ($Relationship) {
+        $Invite = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$($Relationship.id)'"
+        $APINAME = 'GDAPInvites'
+        # The invite row records which partner created the relationship
+        $PartnerTenantId = if ($Invite.partnerTenantId) { "$($Invite.partnerTenantId)" } elseif ($Relationship.partnerTenantId) { "$($Relationship.partnerTenantId)" } else { "$env:TenantID" }
+        $RoleMappings = $Invite.RoleMappings | ConvertFrom-Json
+        # Graph keeps removed assignments listed as deleted; their groups still need mapping again.
+        $AccessAssignments = @(New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships/$($Relationship.id)/accessAssignments" -tenantid $PartnerTenantId).Where({ $_.status -notin @('deleted', 'deleting') })
+        $Failed = $false
+        foreach ($Role in $RoleMappings) {
+            # Skip mapping if group is present in relationship
+            if ($AccessAssignments.id -and $AccessAssignments.accessContainer.accessContainerid -contains $Role.GroupId ) { continue }
+            try {
+                $Mappingbody = ConvertTo-Json -Depth 10 -InputObject @{
+                    'accessContainer' = @{
+                        'accessContainerId'   = "$($Role.GroupId)"
+                        'accessContainerType' = 'securityGroup'
+                    }
+                    'accessDetails'   = @{
+                        'unifiedRoles' = @(@{
+                                'roleDefinitionId' = "$($Role.roleDefinitionId)"
+                            })
+                    }
+                }
+                if ($PSCmdlet.ShouldProcess($Relationship.id, "Map group $($Role.GroupName) to customer $($Relationship.customer.displayName)")) {
+                    $null = New-GraphPostRequest -NoAuthCheck $True -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships/$($Relationship.id)/accessAssignments" -tenantid $PartnerTenantId -type POST -body $MappingBody -verbose
+                    Start-Sleep -Milliseconds 100
+                }
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API $APINAME -message "GDAP Group mapping failed for $($Relationship.customer.displayName) - Group: $($role.GroupId) - Exception: $($ErrorMessage.NormalizedError)" -Sev Error -LogData $ErrorMessage
+                $Failed = $true
+            }
+        }
+        # The invite stays until every group is mapped, so the next run retries only the ones still missing.
+        if ($Failed) { return $false }
+
+        if ($PSCmdlet.ShouldProcess($Relationship.id, "Remove invite entry for $($Relationship.customer.displayName)")) {
+            Write-LogMessage -API $APINAME -message "Groups mapped for GDAP Relationship: $($Relationship.customer.displayName) - $($Relationship.customer.displayName)" -Sev Info
+            Remove-CIPPAzDataTableEntity -Force @Table -Entity $Invite
+        }
+        return $true
+    } else {
+        $InviteList = Get-CIPPAzDataTableEntity @Table
+        if (($InviteList | Measure-Object).Count -gt 0) {
+            # Sweep every configured partner's active relationships
+            $Batch = foreach ($Partner in @(Get-CIPPPartnerTenant)) {
+                $Activations = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships?`$filter=status eq 'active'" -tenantid $Partner.RowKey
+                foreach ($Activation in $Activations) {
+                    if ($InviteList.RowKey -contains $Activation.id) {
+                        Write-Information "Mapping groups for GDAP relationship: $($Activation.customer.displayName) - $($Activation.id)"
+                        $Activation | Add-Member -NotePropertyName FunctionName -NotePropertyValue 'ExecGDAPInviteQueue'
+                        $Activation | Add-Member -NotePropertyName partnerTenantId -NotePropertyValue "$($Partner.RowKey)" -Force
+                        $Activation
+                    }
+                }
+            }
+            if (($Batch | Measure-Object).Count -gt 0) {
+                $InputObject = [PSCustomObject]@{
+                    OrchestratorName = 'GDAPInviteOrchestrator'
+                    Batch            = @($Batch)
+                    SkipLog          = $true
+                }
+                #Write-Information ($InputObject | ConvertTo-Json)
+                $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
+                Write-Information "Started GDAP Invite orchestration with ID = '$InstanceId'"
+                return $InstanceId
+            }
+        }
+    }
+}
